@@ -353,7 +353,7 @@ def process_single_item(
 
         # Define path for upscale output
         # IMPORTANT: Use the potentially modified new_title here
-        upscale_output_dir: pathlib.Path = output_base_dir / f"{new_title}_upscaled"
+        upscale_output_dir: pathlib.Path = output_base_dir / new_title
 
         # --- 4. Upscaling ---
         # Uses upscale_lock to ensure serial execution
@@ -483,16 +483,28 @@ def process_single_item(
 
 
                         with zipfile.ZipFile(cbz_target_path, 'w', zipfile.ZIP_STORED) as new_zip:
+                            # Use new_title as the root folder name inside the zip
+                            zip_root_folder = new_title
+                            logging.debug(f"[{thread_name}] Using '{zip_root_folder}' as root folder inside CBZ.")
+
                             for file_path in files_to_zip:
-                                # Compute archive name relative to current_processing_path
-                                arcname = os.path.relpath(file_path, current_processing_path)
+                                # Compute file path relative to the source processing directory
+                                relative_file_path = os.path.relpath(file_path, current_processing_path)
+
+                                # Prepend the desired root folder name to the relative path
+                                # Ensure forward slashes for zip archive compatibility
+                                arcname = os.path.join(zip_root_folder, relative_file_path).replace(os.path.sep, '/')
+
+                                logging.debug(f"[{thread_name}] Adding to CBZ: '{file_path}' as '{arcname}'")
+
                                 # Set timestamp to 01/01/2000 00:00:00 for consistency
                                 zip_info = zipfile.ZipInfo(arcname, date_time=(2000, 1, 1, 0, 0, 0))
                                 zip_info.compress_type = zipfile.ZIP_STORED # Ensure no compression
                                 with open(file_path, 'rb') as f:
                                     new_zip.writestr(zip_info, f.read())
 
-                        logging.info(f"[{thread_name}] Successfully created CBZ: {cbz_target_path}")
+                        logging.info(f"[{thread_name}] Successfully created CBZ: {cbz_target_path} (with files inside '{zip_root_folder}' folder)")
+
                         cbz_path = cbz_target_path # Store the path of the created CBZ
 
                         # Delete folder if requested *and* CBZ creation was successful

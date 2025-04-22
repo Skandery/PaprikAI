@@ -22,12 +22,12 @@ from titlecase import titlecase
 import unicodedata
 
 import logging # Use logging for cleaner output control
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # --- Configuration ---
 
 # Database and Image Paths (MODIFY THESE PATHS)
-IMAGE_BASE_PATH = r"C:\Paprika2\Projet 2" # Base path where 'images' folder resides
+IMAGE_BASE_PATH = r"C:\Paprika2\Scripts\database" # Base path where 'images' folder resides
 DB_PATH = os.path.join(IMAGE_BASE_PATH, "./manga_db/manga.db")
 CURRENT_FILE_DIRECTORY = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Matching Thresholds
@@ -314,6 +314,34 @@ def get_ean_papier(isbn: str) -> Optional[str]:
         logging.error(f"Unexpected error fetching EAN from Numilog: {e}")
         return None
 
+def ensure_isbn_ean_table(conn):
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS isbn_ean_cache (
+                isbn TEXT PRIMARY KEY,
+                ean_papier TEXT
+            );
+        """)
+        conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to ensure isbn_ean_cache table exists: {e}")
+
+
+def get_cached_ean_papier(conn, isbn: str) -> Optional[str]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT ean_papier FROM isbn_ean_cache WHERE isbn = ?", (isbn,))
+    row = cursor.fetchone()
+    return row["ean_papier"] if row else None
+
+def cache_ean_papier(conn, isbn: str, ean: str):
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO isbn_ean_cache (isbn, ean_papier) VALUES (?, ?)
+    """, (isbn, ean))
+    conn.commit()
+
+
 # --- Manga News URL Retrieval (Keep as is, used only if online_search=True as fallback) ---
 def ibsn_to_url(isbn_or_ean: str) -> Optional[str]:
     """Search Manga News for an ISBN or EAN and return the volume URL."""
@@ -506,8 +534,9 @@ def format_manga_title_from_db(
     """Formats the final manga filename using data retrieved from the database."""
 
     # 1. Series Title (Corrected)
-    series_title = correct_series_name_formatting(series_details['title'])
-
+    base_title = determine_best_title(series_details, volume_details)
+    series_title = correct_series_name_formatting(base_title)
+    
     # 2. Volume Number (Formatted)
     volume_part = format_volume_number(volume_details['volume_number'])
 
@@ -692,6 +721,7 @@ def find_name_folder(folder_path: str, online_search: bool = True, upscale: bool
     conn = get_db_connection(DB_PATH)
     if not conn:
         return None # Cannot proceed without DB
+    ensure_isbn_ean_table(conn)
 
     found_volume_id = None
     found_series_id = None
@@ -722,7 +752,11 @@ def find_name_folder(folder_path: str, online_search: bool = True, upscale: bool
 
                 # 1b: Try getting EAN Papier (if online search allowed)
                 if not found_volume_id and online_search:
-                    ean_papier = get_ean_papier(isbn)
+                    ean_papier = get_cached_ean_papier(conn, isbn)
+                    if not ean_papier and online_search:
+                        ean_papier = get_ean_papier(isbn)
+                        if ean_papier:
+                            cache_ean_papier(conn, isbn, ean_papier)
                     if ean_papier:
                         # 1c: Check EAN Papier in DB
                         volume_details = query_volume_by_ean(conn, ean_papier)
@@ -820,10 +854,90 @@ def find_name_folder(folder_path: str, online_search: bool = True, upscale: bool
 
 # --- Example Usage ---
 
+def _clean_title_of_volume_suffix(title: Optional[str]) -> str:
+    """Removes volume indicators and edition information from a title string."""
+    if not title:
+        return ""
+
+    cleaned = title
+
+    # Patterns to remove volume/tome indicators and edition information
+    patterns = [
+        r'(?i)\s*[-–—]?\s*[Ee]dition\s+\d{4}.*?$',      # Matches " - Edition 2022 Vol.1" or similar
+        r'(?i)\s*[-–—]?\s*[éÉ]dition\s+\d{4}.*?$',      # Matches French "édition 2010" patterns
+        r'(?i)\s*[-–—]?\s*(?:Vol\.?|Tome|T|#)\s*\d+.*?$', # Matches " - Vol. 1", " T01", " #5", etc.
+        r'(?i)\s+\d+$'                                   # Matches just a number at the end (e.g., "Series 1")
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, '', cleaned).strip()
+    
+    # Handle cases like "Title, Intégrale" where the volume info might be different
+    if re.search(r'(?i),\s*Intégrale$', cleaned):
+        cleaned = re.sub(r'(?i),\s*Intégrale$', ' - Intégrale', cleaned).strip()
+
+    return cleaned.strip()
+
+
+
+def determine_best_title(series_details: sqlite3.Row, volume_details: sqlite3.Row) -> str:
+    """
+    Determines the best base title to use, preferring a more specific volume title
+    (like an edition name) over the generic series title if appropriate.
+
+    Args:
+        series_details: The sqlite3.Row object for the series.
+        volume_details: The sqlite3.Row object for the volume.
+
+    Returns:
+        The chosen and cleaned base title string.
+    """
+    series_title = series_details['title'] if series_details and 'title' in series_details.keys() else ""
+    volume_title = volume_details['title'] if volume_details and 'title' in volume_details.keys() else ""
+
+    if not series_title and not volume_title:
+        logging.warning("Both series and volume titles are missing.")
+        return "Unknown Series" # Or some default
+
+    # Clean the volume title to remove "Vol. X", "T0X" etc. for comparison
+    cleaned_volume_title = _clean_title_of_volume_suffix(volume_title)
+
+    # Normalize for comparison
+    s_title_norm = series_title.strip().lower() if series_title else ""
+    cleaned_v_title_norm = cleaned_volume_title.strip().lower() if cleaned_volume_title else ""
+
+    # --- Decision Logic ---
+    chosen_title = series_title.strip() # Default to series title
+
+    if not cleaned_v_title_norm or cleaned_v_title_norm == s_title_norm:
+        # If volume title is empty after cleaning, or identical to series title, use series title
+        logging.debug(f"Using series title: '{chosen_title}' (Volume title was '{volume_title}')")
+    elif s_title_norm in cleaned_v_title_norm and len(cleaned_v_title_norm) > len(s_title_norm):
+        # If cleaned volume title CONTAINS the series title and is LONGER,
+        # it likely has extra edition info (e.g., "Series - Perfect Edition"). Use it.
+        chosen_title = cleaned_volume_title.strip()
+        logging.debug(f"Using cleaned volume title: '{chosen_title}' (Original volume: '{volume_title}', Series: '{series_title}')")
+    elif s_title_norm and not cleaned_v_title_norm.startswith(s_title_norm):
+         # If the cleaned volume title DOES NOT start with the series title,
+         # it might be a significantly different naming (like an Intégrale). Prefer it.
+         # Example: Series="BB Project", Volume="BB project - Intégrale" -> CleanedVol="BB project - Intégrale"
+         # Example: Series="Series A", Volume="Spin-off B Vol 1" -> CleanedVol="Spin-off B"
+         # This condition might need refinement based on more examples.
+         # Let's check if the volume title seems more specific/different.
+         # A simple check: if volume title doesn't start with series title, assume it's deliberately different.
+         chosen_title = cleaned_volume_title.strip()
+         logging.debug(f"Using cleaned volume title (differs significantly): '{chosen_title}' (Original volume: '{volume_title}', Series: '{series_title}')")
+    # else: Stick with the default series_title if volume title is shorter or just adds volume info we already removed.
+
+    if not chosen_title: # Fallback if somehow the chosen title ended up empty
+        logging.warning("Chosen title is empty, falling back to 'Unknown Series'")
+        return "Unknown Series"
+
+    return chosen_title
 
 #if __name__ == "__main__":
 #    # Ensure the path uses correct separators for your OS and exists
-#    example_folder = r"C:\Paprika2\Git3\ComfyUI-Upscaler-Tensorrt - Copie\Un Dragon Dans Ma Cuisine - T04"
+#    example_folder = r"C:\Paprika2\Git3\PaprikAI\output\Sanctuary - Perfect Edition T03 (Fumimura-Ikegami) (2023) [Digital-1920u] [Manga FR] (PapriKa+)"
 #
 #    if os.path.exists(example_folder):
 #        logging.info(f"--- Running Example for: {example_folder} ---")
@@ -839,4 +953,3 @@ def find_name_folder(folder_path: str, online_search: bool = True, upscale: bool
 #    else:
 #        logging.error(f"Error: Example folder path does not exist: {example_folder}")
 #        logging.error("Please update the 'example_folder' variable in the script.")
-#

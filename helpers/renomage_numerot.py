@@ -33,7 +33,7 @@ def _initialize_easyocr_reader():
     """Initializes and returns the EasyOCR reader."""
     try:
         import easyocr # Import here to make it optional if only using other parts
-        logging.info("Initializing EasyOCR Reader (this may take a moment)...")
+        logging.debug("Initializing EasyOCR Reader (this may take a moment)...")
         # Try GPU first
         try:
             reader = easyocr.Reader(['en'], gpu=True)
@@ -249,7 +249,7 @@ def _perform_rename(folder_path, rename_map, operation_name="main"):
 
                 try:
                     shutil.move(temp_path, new_path)
-                    logging.info(f"Renamed ({operation_name}): {old_name} -> {new_name}")
+                    logging.debug(f"Renamed ({operation_name}): {old_name} -> {new_name}")
                     success_count += 1
                     # Mark as moved back by removing from moved_to_temp
                     del moved_to_temp[old_name]
@@ -343,7 +343,7 @@ def _correct_negative_and_zero_indices(folder_path):
     Subsequent files originally < 1 become 000a.jpg, 000b.jpg, etc.
     Handles potential conflicts with existing files.
     """
-    logging.info(f"Correcting indices < 1 in folder: {folder_path}")
+    logging.debug(f"Correcting indices < 1 in folder: {folder_path}")
     image_files = _get_image_files(folder_path)
 
     file_numbers = []
@@ -367,7 +367,7 @@ def _correct_negative_and_zero_indices(folder_path):
     files_to_correct = [f for f in file_numbers if f['index'] < 1]
 
     if not files_to_correct:
-        logging.info("No files with index < 1 found. Correction step skipped.")
+        logging.debug("No files with index < 1 found. Correction step skipped.")
         return True
 
     logging.error(f"Found {len(files_to_correct)} files with index < 1 to correct.")
@@ -423,7 +423,7 @@ def _handle_double_pages(folder_path):
     Example: 002.jpg (exists), 003.jpg (is DP) -> renames 003.jpg to 002-003.jpg, deletes 002.jpg
     Runs *after* main rename and correction steps.
     """
-    logging.info(f"Checking for double pages (DP) in: {folder_path}")
+    logging.debug(f"Checking for double pages (DP) in: {folder_path}")
     image_files = _get_image_files(folder_path)
 
     files_data = []
@@ -448,7 +448,7 @@ def _handle_double_pages(folder_path):
     # Create a quick lookup map from index to filename
     index_to_name = {f['index']: f['name'] for f in files_data}
 
-    logging.info(f"Analyzing {len(files_data)} numbered files for DP...")
+    logging.debug(f"Analyzing {len(files_data)} numbered files for DP...")
     for i, current_file in enumerate(files_data):
         current_name = current_file['name']
         current_index = current_file['index']
@@ -526,7 +526,7 @@ def _handle_double_pages(folder_path):
     if dp_rename_map:
         rename_success = _perform_rename(folder_path, dp_rename_map, operation_name="dp_rename")
     else:
-        logging.info("No DP renames required.")
+        logging.debug("No DP renames required.")
 
     if not rename_success:
         logging.error("DP renaming failed. Skipping deletion step.")
@@ -564,6 +564,8 @@ def _create_white_page_if_needed(folder_path):
     """
     Creates a white image placeholder based on specific conditions of the *second* image file
     found *after* all renaming and DP handling.
+    Also ensures the first image is named '000.jpg'.
+
     Conditions: Second file is 001.jpg, 003.jpg, etc. (odd numbers)
     Creates: 000a.jpg, 002.jpg, etc. respectively.
     NOTE: This logic might be fragile if DP handling significantly changes numbering.
@@ -572,17 +574,14 @@ def _create_white_page_if_needed(folder_path):
     try:
         # Get image files *after* all processing
         image_files = _get_image_files(folder_path)
-        # We need a robust sort that handles 000, 000a, 001, 002-003 etc.
-        # Simple alphabetical sort might be okay if names are well-formed.
-        # Let's try a natural sort if possible, otherwise basic sort.
+        
         try:
-            import natsort # Optional dependency
+            import natsort  # Optional dependency
             image_files = natsort.natsorted(image_files)
-            logging.info("Using natural sort for white page check.")
+            logging.debug("Using natural sort for white page check.")
         except ImportError:
-            image_files.sort() # Fallback to basic sort
+            image_files.sort()
             logging.info("Using basic sort for white page check (install natsort for better ordering).")
-
 
         if len(image_files) < 2:
             logging.info("Folder has less than 2 images after processing. Skipping white page creation.")
@@ -590,60 +589,66 @@ def _create_white_page_if_needed(folder_path):
 
         first_image_name = image_files[0]
         second_image_name = image_files[1]
-        logging.info(f"First image: {first_image_name}, Second image: {second_image_name}")
+        logging.debug(f"First image: {first_image_name}, Second image: {second_image_name}")
 
-        # Define the mapping based on the *second* image's name
-        # This logic assumes the second image indicates a missing *previous* page.
-        # Example: If second image is '001.jpg', it implies '000a.jpg' might be missing (cover pairing?)
-        # Example: If second image is '003.jpg', it implies '002.jpg' might be missing.
+        # Rename the first image to '000.jpg' if it’s not already
+        if first_image_name.lower() != '000.jpg':
+            original_path = os.path.join(folder_path, first_image_name)
+            new_path = os.path.join(folder_path, '000.jpg')
+            
+            # If '000.jpg' already exists, warn and skip renaming
+            if os.path.exists(new_path):
+                logging.warning(f"'000.jpg' already exists. Skipping renaming of '{first_image_name}'.")
+            else:
+                os.rename(original_path, new_path)
+                logging.debug(f"Renamed '{first_image_name}' to '000.jpg'.")
+                first_image_name = '000.jpg'  # Update variable to reflect rename
+
+        # Now continue with white page logic
         target_white_page = None
         required_white_page_name = None
 
         second_name_lower = second_image_name.lower()
         if second_name_lower == '001.jpg':
-            required_white_page_name = '000a.jpg' # Special case for cover?
+            required_white_page_name = '000a.jpg'
         else:
-            # Check if second image is an odd number N.jpg, implies N-1.jpg is missing
             match = re.match(r'(\d+)\.(jpg|jpeg|png|webp)$', second_name_lower)
             if match:
                 num = int(match.group(1))
                 ext = match.group(2)
-                if num > 0 and num % 2 != 0: # Is it an odd number > 0?
-                    required_white_page_name = f"{num-1:03d}.{ext}" # e.g., 003.jpg -> 002.jpg
+                if num > 0 and num % 2 != 0:
+                    required_white_page_name = f"{num-1:03d}.{ext}"
 
         if required_white_page_name:
             white_image_path = os.path.join(folder_path, required_white_page_name)
 
             if os.path.exists(white_image_path):
-                logging.info(f"Required white page '{required_white_page_name}' already exists. Skipping creation.")
+                logging.debug(f"Required white page '{required_white_page_name}' already exists. Skipping creation.")
                 return True
 
-            # Get dimensions from the *first* available image (could be 000.jpg or cover)
             ref_image_path = os.path.join(folder_path, first_image_name)
-            logging.info(f"Condition met. Need to create '{required_white_page_name}'. Using '{first_image_name}' for dimensions.")
+            logging.debug(f"Condition met. Need to create '{required_white_page_name}'. Using '{first_image_name}' for dimensions.")
 
             try:
                 with Image.open(ref_image_path) as img:
                     width, height = img.size
 
-                # Create a new white image
                 white_image = Image.new('RGB', (width, height), color='white')
                 white_image.save(white_image_path)
-                logging.info(f"Created white page '{required_white_page_name}' (size {width}x{height}).")
+                logging.debug(f"Created white page '{required_white_page_name}' (size {width}x{height}).")
                 return True
 
             except FileNotFoundError:
-                 logging.error(f"Error: Could not find reference image {ref_image_path} to get dimensions.")
-                 return False
+                logging.error(f"Error: Could not find reference image {ref_image_path} to get dimensions.")
+                return False
             except UnidentifiedImageError:
-                 logging.error(f"Error: Could not read reference image {ref_image_path} (corrupt?).")
-                 return False
+                logging.error(f"Error: Could not read reference image {ref_image_path} (corrupt?).")
+                return False
             except Exception as e:
                 logging.error(f"Error creating white page {required_white_page_name}: {e}")
                 return False
         else:
-            # logging.info(f"Second image '{second_image_name}' does not match criteria for white page creation.")
-            return True # No action needed
+            return True
 
     except Exception as e:
         logging.error(f"An unexpected error occurred during white page check: {e}")
@@ -691,7 +696,7 @@ def numerotation(folderpath):
     filename_to_gap = {}
     gap_counter = Counter()
     processed_files_count = 0
-    logging.info("Analyzing page numbers (using EasyOCR)...")
+    logging.debug("Analyzing page numbers (using EasyOCR)...")
     for filename in image_files:
         file_path = os.path.join(folderpath, filename)
         filename_index = _extract_filename_index(filename)
@@ -806,20 +811,20 @@ def numerotation(folderpath):
 
 
 #* --- Example Usage ---
-if __name__ == "__main__":
-    logging.info("Manga Numerotation Script v2")
-
-    # --- Option 1: Process a specific folder ---
-    # target_folder = 'path/to/your/manga/chapter' # <--- CHANGE THIS
-    # Example with potentially problematic name (ensure folder exists):
-    target_folder = 'Jalouses T04 copy'
-    # target_folder = 'Call of the Night T06 (Kotoyama) (2023) [Digital-1920] [Manga FR] (PapriKa+)'
-
-    if target_folder and os.path.exists(target_folder):
-         logging.info(f"Processing single folder: {target_folder}")
-         numerotation(target_folder)
-    elif target_folder:
-         logging.info(f"Error: Specified target folder '{target_folder}' not found.")
-         logging.info("Please modify the 'target_folder' variable in the script's __main__ block.")
-    else:
-         logging.info("No specific target_folder set.")
+#if __name__ == "__main__":
+#    logging.info("Manga Numerotation Script v2")
+#
+#    # --- Option 1: Process a specific folder ---
+#    # target_folder = 'path/to/your/manga/chapter' # <--- CHANGE THIS
+#    # Example with potentially problematic name (ensure folder exists):
+#    target_folder = 'Jalouses T04 copy'
+#    # target_folder = 'Call of the Night T06 (Kotoyama) (2023) [Digital-1920] [Manga FR] (PapriKa+)'
+#
+#    if target_folder and os.path.exists(target_folder):
+#         logging.info(f"Processing single folder: {target_folder}")
+#         numerotation(target_folder)
+#    elif target_folder:
+#         logging.info(f"Error: Specified target folder '{target_folder}' not found.")
+#         logging.info("Please modify the 'target_folder' variable in the script's __main__ block.")
+#    else:
+#         logging.info("No specific target_folder set.")

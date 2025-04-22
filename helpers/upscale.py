@@ -8,30 +8,33 @@ from PIL import Image
 from helpers.trt_utilities import Engine
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import cv2 # Added import for cv2
+import cv2
 import torchvision.transforms as transforms
 import timm
 from tqdm import tqdm
 import math # For isnan
 import logging
 
+logging.basicConfig(level=logging.INFO)
 
+for name in logging.root.manager.loggerDict:
+    if 'vips' in name.lower():
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 # ==============================================================================
 # Configuration (Moved inside function or passed as args where appropriate)
 # ==============================================================================
-
 # Determine script directory for relative paths (like ICC profiles)
 CURRENT_FILE_DIRECTORY = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --- Classification Configuration ---
 # These could be parameters of process_upscale if needed
-CLASSIFICATION_MODEL_PATH = os.path.join(CURRENT_FILE_DIRECTORY, "./models/97.62-color_detector-regnety_320.swag_ft_in1k.pth")
+CLASSIFICATION_MODEL_PATH = os.path.join(CURRENT_FILE_DIRECTORY, "./models/color_detector-97.62-regnety_320.swag_ft_in1k.pth")
 CLASSIFICATION_MODEL_NAME = "regnety_320.swag_ft_in1k"
 CLASSIFICATION_INPUT_SIZE = 384
 CLASSIFICATION_NUM_CLASSES = 2
-CLASSIFICATION_THRESHOLD_LOW = 0.46 # Lower bound for uncertain class (Prob Class 0)
-CLASSIFICATION_THRESHOLD_HIGH = 0.53 # Upper bound for uncertain class (Prob Class 0)
+CLASSIFICATION_THRESHOLD_LOW = 0.46 # Lower bound for uncertain class to use 4x_MangaJaNai_V0.5
+CLASSIFICATION_THRESHOLD_HIGH = 0.53 # Upper bound for uncertain class
 ENABLE_TILING = True # Set to False to disable tiling globally if needed
 TILE_SIZE = 1024     # Input tile size (adjust based on VRAM, must be <= 1280)
 TILE_OVERLAP = 64    # Overlap between tiles (pixels on input)
@@ -68,14 +71,14 @@ OTHER_MODELS = {
 }
 
 # --- Pipeline Configuration ---
-MAX_QUEUE_SIZE = 10 # Note: This isn't explicitly used with current ThreadPoolExecutor setup
+MAX_QUEUE_SIZE = 10 
 NUM_LOAD_WORKERS = 4
 NUM_SAVE_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Upscaling Dimension Limits ---
-MIN_DIM = 64   # Lowered minimum dimension slightly
-MAX_DIM = 4096 # Increased max dimension slightly for TRT profile flexibility
+MIN_DIM = 64
+MAX_DIM = 4096 
 
 # --- Post-Upscaling Resize Configuration ---
 TARGET_WIDTH_TALL = 1920
@@ -119,11 +122,10 @@ def resize_image_pyvips(vips_image, target_height):
     if vips_image.height == target_height:
         return vips_image # No resize needed
     scale_factor = target_height / vips_image.height
-    # Using 'thumbnail' is often efficient for downscaling
     resized_image = vips_image.thumbnail_image(
-        int(vips_image.width * scale_factor), # Target width based on height scale
+        int(vips_image.width * scale_factor),
         height=target_height,
-        size='down' # Use 'down' for potentially better quality when downscaling
+        size='down'
     )
     return resized_image
 
@@ -193,7 +195,7 @@ def classify_images_in_folder(folder_path, model, transform, device):
                      if os.path.isfile(os.path.join(folder_path, f)) and f.lower().endswith(image_extensions)]
     except FileNotFoundError:
         logging.error(f"Error: Input folder not found: {folder_path}")
-        return {}, 0.0, 0, 0 # Return empty results and zero counts/time
+        return {}, 0.0, 0, 0
     except Exception as e:
         logging.error(f"Error listing files in {folder_path}: {str(e)}")
         return {}, 0.0, 0, 0
@@ -231,11 +233,11 @@ def classify_images_in_folder(folder_path, model, transform, device):
 def convert_image_to_grayscale(image: np.ndarray) -> np.ndarray:
     """Convert an RGB or RGBA image to grayscale using OpenCV."""
     if image.ndim == 3:
-        if image.shape[2] == 3: # RGB
+        if image.shape[2] == 3:
             return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        elif image.shape[2] == 4: # RGBA
+        elif image.shape[2] == 4:
             return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
-    elif image.ndim == 2: # Already grayscale
+    elif image.ndim == 2:
         return image
     else:
         raise ValueError(f"Unsupported image ndim for grayscale conversion: {image.ndim}")
@@ -272,12 +274,10 @@ def calculate_manga_black_level(image_paths: list[str], sample_percentage: float
 
     for img_path in tqdm(sampled_files, desc="Analyzing Black Levels", leave=False):
         try:
-            # Load image using OpenCV
             img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED) # Load as is first
             if img is None:
                 raise IOError(f"cv2.imread failed to load image: {img_path}")
 
-            # Convert to grayscale for analysis
             img_gray = convert_image_to_grayscale(img) # Use the helper function
 
             # Find the darkest 10% of pixels
@@ -302,7 +302,7 @@ def calculate_manga_black_level(image_paths: list[str], sample_percentage: float
 
     if errors:
         logging.error("Errors occurred during black level analysis:")
-        for error in errors[:5]: # Print first few errors
+        for error in errors[:5]:
             logging.error(f"  - {error}")
         if len(errors) > 5:
             logging.error(f"  ... and {len(errors) - 5} more errors.")
@@ -374,8 +374,7 @@ def load_preprocess_task(input_image_path, output_image_path, force_target_heigh
         original_height = image_vips.height
         if force_target_height is not None and force_target_height > 0:
             image_vips = resize_image_pyvips(image_vips, force_target_height)
-            # Update effective original shape for post-processing calculations
-            H_orig = image_vips.height # Should be force_target_height
+            H_orig = image_vips.height
             W_orig = image_vips.width
         else:
             H_orig = image_vips.height
@@ -409,7 +408,7 @@ def load_preprocess_task(input_image_path, output_image_path, force_target_heigh
 
         # --- Apply Black Level Adjustment ---
         if apply_black_level is not None and apply_black_level > 0:
-            logging.info(f"Applying black level adjustment ({apply_black_level}) to {os.path.basename(input_image_path)}")
+            logging.debug(f"Applying black level adjustment ({apply_black_level}) to {os.path.basename(input_image_path)}")
             image_np = _apply_black_level_adjustment(image_np, apply_black_level)
             # Note: image_np remains 3-channel HWC uint8 after adjustment
 
@@ -628,7 +627,7 @@ def postprocess_save_task(output_tensor_cpu, original_shape, scale_factor, outpu
         # --- Apply Resize based on Group Type ---
         current_h, current_w, _ = output_image_np_rgb.shape
         if current_h != target_height or current_w != target_width:
-            logging.info(f"Resizing {os.path.basename(output_image_path)} from {current_w}x{current_h} to {target_width}x{target_height} using '{group_type}' method.")
+            logging.debug(f"Resizing {os.path.basename(output_image_path)} from {current_w}x{current_h} to {target_width}x{target_height} using '{group_type}' method.")
             if group_type == 'manga_2x':
                 # Use DotGain20 resize for manga 2x group
                 output_image_gray = convert_image_to_grayscale(output_image_np_rgb)
@@ -793,7 +792,7 @@ def infer_tiled(engine, input_tensor_cpu, scale_factor, tile_size, overlap, max_
                 output_tensor_full_cpu[:, :, y_start_out:y_end_out, x_start_out:x_end_out] += output_tile_cpu
                 output_counts[:, :, y_start_out:y_end_out, x_start_out:x_end_out] += 1
                 processed_tiles += 1
-                logging.info(f"\rProcessed tile {processed_tiles}/{total_tiles}", end="")
+                logging.info(f"\rProcessed tile {processed_tiles}/{total_tiles}")
 
         logging.info("Stitching complete. Finalizing output...")
 
@@ -1024,12 +1023,9 @@ def process_image_group(image_paths, model_config, output_folder_path, device, f
         save_executor.shutdown(wait=True) # Wait for saving to finish
         logging.info(f"Resetting engine context for group: {model_config['name']}...")
         if engine:
-            # Instead of del engine, just ensure context is released if needed
-            # The engine object itself might be reused if script structure changes
             if engine.context:
                  del engine.context # Explicitly delete context
                  engine.context = None
-            # del engine # Keep engine object if needed later, just release context/buffers
         if device.type == 'cuda':
             torch.cuda.empty_cache() # Final cleanup for the group
 
@@ -1041,8 +1037,7 @@ def process_image_group(image_paths, model_config, output_folder_path, device, f
 # ==============================================================================
 
 def process_upscale(input_folder_path, output_folder_path, force_image_height=None):
-    logfilename = os.path.basename(input_folder_path) + ".log"
-    logging.basicConfig(level=logging.ERROR, filename=logfilename)
+
     """
     Classifies images, calculates black level for manga, selects appropriate
     upscaling models (dynamic for manga), applies black level adjustment to manga,
@@ -1284,8 +1279,8 @@ def process_upscale(input_folder_path, output_folder_path, force_image_height=No
 #    OUTPUT_DIR = r"C:\Paprika2\Projet 2 - Copie (3)\Auto rename\sortietrt_classified_dynamic_blacklevel_groupresize" # Changed output dir name
 #
 #    # --- Optional: Set a height to force manga images to before upscaling ---
-#    # FORCE_HEIGHT = None
-#    FORCE_HEIGHT = 1200 # Example: Force to 1200p input
+#    FORCE_HEIGHT = None
+#    #FORCE_HEIGHT = 1200 # Example: Force to 1200p input
 #
 #    # --- Run the processing ---
 #    try:
